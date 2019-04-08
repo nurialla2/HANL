@@ -1,0 +1,141 @@
+---
+title: "High Acuity Patients with Normal Lactate"
+author: "Josep Gomez"
+date: "8 abril de 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Lactate Discordance Project: Exploratory Analysis of Lactate in MIMIC-III by Illness Severity
+
+Josep Gomez Alvarez
+
+This notebook extracts the maximum lactate in the first 24 hours for all patients in the MIMIC-III database. After excluding patients with length of stay below four hours, those lacking data, and those under the age of 16, the lactate levels are grouped using deciles of the each severity of illness score present in the materialized views of MIMIC-III (https://github.com/MIT-LCP/mimic-code/tree/master/concepts).
+
+## 0 - Environment Setup
+
+We have MIMIC-III hosted in a local Postgres database on Winodws (https://mimic.physionet.org/tutorials/install-mimic-locally-windows/).
+
+```{r}
+require(RPostgreSQL)
+require(sqldf)
+
+# connexion:
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname="mimic",host="localhost",port=5432,user="postgres",password="postgres")
+
+# parametrisation of the sqldf function.
+options(sqldf.RPostgreSQL.user = "postgres"
+        , sqldf.RPostgreSQL.password = "postgres"
+        , sqldf.RPostgreSQL.dbname = "mimic"
+        , sqldf.RPostgreSQL.host = "localhost"
+        , sqldf.RPostgreSQL.port = 5432)
+```
+
+## 1 - Extraction of patients with lactate at 24h
+
+Get worst Lactate at the first 24h of admission. Note that we are using the labsfirstday materialized view.
+
+```{r}
+LacFirstDay_Q <- 'SELECT icustay_id, lactate_max FROM mimiciii.labsfirstday WHERE lactate_max IS NOT NULL'
+LacFirstDay <- sqldf(LacFirstDay_Q)
+rm(LacFirstDay_Q)
+```
+
+## 2 - Exclude patients
+
+Add age ad admission and LOS and remove those under 16 and with LOS < 1 day and set up ages over 200 to 91.30. We are using the materialized view icustay_detail.
+
+```{r}
+require(dplyr)
+
+Adults24hLOSmin_Q <- 'SELECT icustay_id, admission_age, los_icu FROM mimiciii.icustay_detail'
+Adults24hLOSmin <- sqldf(Adults24hLOSmin_Q)
+
+Cohort <- left_join(LacFirstDay, Adults24hLOSmin, by='icustay_id')
+rm(Adults24hLOSmin_Q, Adults24hLOSmin, LacFirstDay)
+
+Cohort <- Cohort[which(Cohort$admission_age>=16 & Cohort$los_icu>=0.2),]
+Cohort$admission_age <- ifelse(Cohort$admission_age>200,91.3,Cohort$admission_age)
+```
+
+## 3 - Add scores
+
+Add all severity of illness scores present in MIMIC-III database (using the materialized views).
+
+```{r}
+APSIII_Q <- 'SELECT icustay_id, apsiii FROM mimiciii.apsiii'
+APSIII <- sqldf(APSIII_Q)
+
+OASIS_Q <- 'SELECT icustay_id, oasis FROM mimiciii.oasis'
+OASIS <- sqldf(OASIS_Q)
+
+SAPS_Q <- 'SELECT icustay_id, saps FROM mimiciii.saps'
+SAPS <- sqldf(SAPS_Q)
+
+SAPSII_Q <- 'SELECT icustay_id, sapsii FROM mimiciii.sapsii'
+SAPSII <- sqldf(SAPSII_Q)
+
+SIRS_Q <- 'SELECT icustay_id, sirs FROM mimiciii.sirs'
+SIRS <- sqldf(SIRS_Q)
+
+SOFA_Q <- 'SELECT icustay_id, sofa, respiration, coagulation, liver, cardiovascular, cns, renal FROM mimiciii.sofa'
+SOFA <- sqldf(SOFA_Q)
+
+rm(APSIII_Q,OASIS_Q,SAPS_Q,SAPSII_Q,SIRS_Q,SOFA_Q)
+
+Cohort <- left_join(Cohort, APSIII, by='icustay_id')
+Cohort <- left_join(Cohort, OASIS, by='icustay_id')
+Cohort <- left_join(Cohort, SAPS, by='icustay_id')
+Cohort <- left_join(Cohort, SAPSII, by='icustay_id')
+Cohort <- left_join(Cohort, SIRS, by='icustay_id')
+Cohort <- left_join(Cohort, SOFA, by='icustay_id')
+
+rm(APSIII,OASIS,SAPS,SAPSII,SIRS,SOFA)
+```
+
+## 4 - Make deciles
+
+Add labels to patients according to the decile in which they fall for each severity of illness score.
+
+```{r}
+Cohort$apsiii_decile <- as.factor(ntile(Cohort$apsiii, 10))
+Cohort$oasis_decile <- as.factor(ntile(Cohort$oasis, 10))
+Cohort$saps_decile <- as.factor(ntile(Cohort$saps, 10))
+Cohort$sapsii_decile <- as.factor(ntile(Cohort$sapsii, 10))
+Cohort$sirs_decile <- as.factor(ntile(Cohort$sirs, 10))
+Cohort$sofa_decile <- as.factor(ntile(Cohort$sofa, 10))
+```
+
+## 5 -Lactate level label
+
+Add a label according to the lactate level (<2=Normal;>=2=High).
+
+```{r}
+Cohort$lactate_label <- ifelse(Cohort$lactate_max<2,'Normal','High')
+```
+
+## 6 - Plot lactate distributions.
+
+The following code will plot lactate distributions according to oasis deciles. One can plot lactate distributions according to other severity of illness scores deciles previously calculated in point 4.
+
+```{r}
+require(ggplot2)
+
+dp_oasis <- ggplot(Cohort, aes(x=Cohort$lactate_max, colour=Cohort$oasis_decile)) + geom_density()
+dp_oasis + scale_color_brewer(palette="Paired")
+```
+
+## 7 - Plot normal lactate proportions.
+
+The following code will plot normal lactate proportions according to oasis deciles. One can plot normal lactate proportions according to other severity of illness scores deciles previously calculated in point 4.
+
+```{r}
+LacPropByDec <- prop.table(table(Cohort$oasis_decile, Cohort$lactate_label),1)
+NormalLacPropByDec <- LacPropByDec[,2]
+barplot(NormalLacPropByDec)
+```
+
